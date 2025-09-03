@@ -43,6 +43,28 @@ async function readRatings(user) {
   }
   return results;
 }
+// Fallback: read Diary from HTML pages instead of RSS
+async function readDiaryHTML(user) {
+  const out = [];
+  for (let p = 1; p <= 5; p++) {
+    const url = p === 1
+      ? `https://letterboxd.com/${user}/films/diary/`
+      : `https://letterboxd.com/${user}/films/diary/page/${p}/`;
+    const html = await fetchText(url).catch(()=> "");
+    if (!html) break;
+    const $ = cheerio.load(html);
+    // entries look like .diary-entry-row or within .diary-table
+    $(".diary-entry-title a").each((_, a) => {
+      const name = $(a).text().trim();
+      const year = ($(a).next(".diary-entry-year").text().trim().match(/\d{4}/) || [null])[0];
+      if (name) out.push({ name, year });
+    });
+    if ($(".diary-entry-title a").length === 0) break; // no more pages
+  }
+  // de-dupe
+  const map = new Map(out.map(f => [`${f.name}~${f.year}`, f]));
+  return Array.from(map.values());
+}
 
 async function readWatchlist(user) {
   const out = [];
