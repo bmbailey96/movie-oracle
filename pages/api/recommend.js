@@ -1,3 +1,4 @@
+// pages/api/recommend.js — v3-proxy
 import * as cheerio from "cheerio";
 import OpenAI from "openai";
 
@@ -6,42 +7,37 @@ const TMDB = "https://api.themoviedb.org/3";
 const TMDB_KEY = process.env.TMDB_API_KEY;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// version header so we can confirm deploy
+function setVersion(res){ res.setHeader("X-Oracle-Version","v3-proxy"); }
+
 // ---------- utils ----------
 function cleanUser(u=""){ return (u||"").trim().replace(/^@/, "").replace(/^\/+|\/+$/g, ""); }
 function uniq(arr){ return [...new Set(arr)]; }
 
-// Try direct fetch; if page looks empty, fall back to a mirror that returns static HTML
+// Try direct fetch; if blank, fall back to a static mirror that returns the HTML
 async function fetchLB(url) {
-  // 1) direct
   try {
     const r = await fetch(url, { headers: { "User-Agent": UA, "Accept-Language":"en-US,en;q=0.9" }, cache:"no-store" });
     const text = await r.text();
-    // if it’s clearly got content, return it
     if (r.ok && text && text.length > 500 && /<html/i.test(text)) return text;
   } catch(_) {}
-
-  // 2) fallback mirror (read-only)
-  // example: https://r.jina.ai/http://letterboxd.com/USER/films/ratings/
   try {
     const proxy = "https://r.jina.ai/http://" + url.replace(/^https?:\/\//,"");
     const r2 = await fetch(proxy, { headers: { "User-Agent": UA }, cache:"no-store" });
     const t2 = await r2.text();
     if (r2.ok && t2 && t2.length > 500) return t2;
   } catch(_){}
-
-  return ""; // give up
+  return "";
 }
 
-// ---------- letterboxd readers (robust selectors + proxy fallback) ----------
+// ---------- letterboxd readers ----------
 async function readRatings(user) {
   const results = [];
   for (let p=1; p<=6; p++){
-    const url = `https://letterboxd.com/${user}/films/ratings/page/${p}/`;
-    const html = await fetchLB(url);
+    const html = await fetchLB(`https://letterboxd.com/${user}/films/ratings/page/${p}/`);
     if (!html) break;
     const $ = cheerio.load(html);
 
-    // List layout
     $("li.film-detail").each((_, li)=>{
       const name = $(li).find(".headline-2 a").first().text().trim();
       const yr = $(li).find(".headline-2 .metadata").text().trim().match(/\d{4}/)?.[0];
@@ -51,7 +47,6 @@ async function readRatings(user) {
       if (name) results.push({ name, year: yr, stars });
     });
 
-    // Grid layout (posters)
     $("ul.poster-list li").each((_, li)=>{
       const a = $(li).find("a").first();
       const name = a.attr("data-film-name") || a.attr("aria-label") || "";
@@ -168,13 +163,16 @@ function cosine(a,b){ let dot=0,na=0,nb=0; for (let i=0;i<a.length;i++){ dot+=a[
 
 // ---------- main ----------
 export default async function handler(req, res){
+  setVersion(res);
   try{
-    const { user:rawUser, mode="watchlist", onlyFlatrate=true } = req.method==="GET" ? req.query : (req.body||{});
-    const user = cleanUser(rawUser);
+    const params = req.method==="GET" ? req.query : (req.body||{});
+    const user = cleanUser(params.user);
+    const mode = (params.mode||"watchlist").toString();
+    const onlyFlatrate = String(params.onlyFlatrate||"true") !== "false";
+
     if (!user) return res.status(400).send("Need a username.");
     if (!TMDB_KEY || !process.env.OPENAI_API_KEY) return res.status(500).send("Server missing API keys.");
 
-    // Read all sources (with proxy fallback)
     const [ratings, diary, watchlist] = await Promise.all([
       readRatings(user).catch(()=>[]),
       readDiaryHTML(user).catch(()=>[]),
@@ -182,10 +180,10 @@ export default async function handler(req, res){
     ]);
 
     if (!ratings.length && !diary.length && !watchlist.length){
-      return res.status(400).send("Still couldn't read any public data for this username. Double-check spelling; if correct, Letterboxd may be fully blocking scraping for this profile.");
+      return res.status(400).send("Still couldn't read any public data for this username. If your pages open fine in your browser, this proxy should now handle it—double-check spelling.");
     }
 
-    // build liked seeds from ratings ≥4★, else diary first page
+    // seeds from ratings ≥4★, else diary, else watchlist
     const liked = ratings.filter(r=> r.stars>=4).slice(0,200);
     const likedIds = [];
     for (const r of liked.slice(0,60)){
@@ -203,7 +201,6 @@ export default async function handler(req, res){
         }
       }
     } else {
-      // AI mode: graph from liked; if no liked, seed from diary; else seed from watchlist
       let seedIds = likedIds;
       if (!seedIds.length && diary.length){
         for (const d of diary.slice(0,40)){
@@ -233,7 +230,7 @@ export default async function handler(req, res){
 
     if (!candidates.length) return res.status(400).send("No candidates available.");
 
-    // taste seeds (embeddings)
+    // taste seeds
     const tasteSeeds = [];
     if (likedIds.length){
       for (const id of likedIds.slice(0,40)){
@@ -286,7 +283,7 @@ export default async function handler(req, res){
       return { ...c, score };
     }).sort((a,b)=> b.score - a.score);
 
-    // providers + flatrate filter
+    // providers + filter
     const enriched=[];
     for (const s of scored.slice(0,80)){
       const providers = await tmdbProviders(s.id, "US");
