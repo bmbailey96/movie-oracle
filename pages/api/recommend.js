@@ -1,4 +1,4 @@
-// pages/api/recommend.js — v3-proxy
+// pages/api/recommend.js — TRAKT-FIRST version
 import * as cheerio from "cheerio";
 import OpenAI from "openai";
 
@@ -7,37 +7,70 @@ const TMDB = "https://api.themoviedb.org/3";
 const TMDB_KEY = process.env.TMDB_API_KEY;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// version header so we can confirm deploy
-function setVersion(res){ res.setHeader("X-Oracle-Version","v3-proxy"); }
-
-// ---------- utils ----------
+// --- util ---
 function cleanUser(u=""){ return (u||"").trim().replace(/^@/, "").replace(/^\/+|\/+$/g, ""); }
 function uniq(arr){ return [...new Set(arr)]; }
+function cosine(a,b){ let dot=0,na=0,nb=0; for (let i=0;i<a.length;i++){ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; } return dot/((Math.sqrt(na)*Math.sqrt(nb))||1); }
 
-// Try direct fetch; if blank, fall back to a static mirror that returns the HTML
+// --- TRAKT (preferred, no scraping) ---
+async function traktGet(path, token){
+  const r = await fetch(`https://api.trakt.tv${path}`, {
+    headers: {
+      "Content-Type": "application/json",
+      "trakt-api-version": "2",
+      "trakt-api-key": process.env.TRAKT_CLIENT_ID,
+      "Authorization": `Bearer ${token}`
+    },
+    cache: "no-store"
+  });
+  if (!r.ok) throw new Error(`${path} ${r.status}`);
+  return await r.json();
+}
+async function fromTrakt(username, token){
+  const [ratings, history, watchlist] = await Promise.all([
+    traktGet(`/users/${username}/ratings/movies`, token).catch(()=>[]),
+    traktGet(`/users/${username}/history/movies`, token).catch(()=>[]),
+    traktGet(`/users/${username}/watchlist/movies`, token).catch(()=>[])
+  ]);
+  const normRatings = ratings.map(x => ({
+    name: x.movie?.title || "",
+    year: (x.movie?.year || "").toString(),
+    stars: x.rating ? (x.rating / 2) : 0  // Trakt 1–10 -> 0–5 stars
+  })).filter(x=>x.name);
+  const normDiary = history.map(x => ({
+    name: x.movie?.title || "",
+    year: (x.movie?.year || "").toString()
+  })).filter(x=>x.name);
+  const normWatch = watchlist.map(x => ({
+    name: x.movie?.title || "",
+    year: (x.movie?.year || "").toString()
+  })).filter(x=>x.name);
+  return { ratings: normRatings, diary: normDiary, watchlist: normWatch };
+}
+
+// --- Letterboxd fallback (only used when no Trakt token) ---
 async function fetchLB(url) {
-  try {
+  // try direct
+  try{
     const r = await fetch(url, { headers: { "User-Agent": UA, "Accept-Language":"en-US,en;q=0.9" }, cache:"no-store" });
     const text = await r.text();
     if (r.ok && text && text.length > 500 && /<html/i.test(text)) return text;
-  } catch(_) {}
-  try {
+  }catch(_){}
+  // fallback proxy (may rate-limit sometimes)
+  try{
     const proxy = "https://r.jina.ai/http://" + url.replace(/^https?:\/\//,"");
     const r2 = await fetch(proxy, { headers: { "User-Agent": UA }, cache:"no-store" });
     const t2 = await r2.text();
     if (r2.ok && t2 && t2.length > 500) return t2;
-  } catch(_){}
+  }catch(_){}
   return "";
 }
-
-// ---------- letterboxd readers ----------
-async function readRatings(user) {
-  const results = [];
-  for (let p=1; p<=6; p++){
+async function readRatingsLB(user){
+  const results=[];
+  for (let p=1;p<=6;p++){
     const html = await fetchLB(`https://letterboxd.com/${user}/films/ratings/page/${p}/`);
     if (!html) break;
     const $ = cheerio.load(html);
-
     $("li.film-detail").each((_, li)=>{
       const name = $(li).find(".headline-2 a").first().text().trim();
       const yr = $(li).find(".headline-2 .metadata").text().trim().match(/\d{4}/)?.[0];
@@ -46,7 +79,6 @@ async function readRatings(user) {
       const stars = m ? (parseInt(m[1],10)/10) : 0;
       if (name) results.push({ name, year: yr, stars });
     });
-
     $("ul.poster-list li").each((_, li)=>{
       const a = $(li).find("a").first();
       const name = a.attr("data-film-name") || a.attr("aria-label") || "";
@@ -56,19 +88,15 @@ async function readRatings(user) {
       const stars = m ? (parseInt(m[1],10)/10) : 0;
       if (name) results.push({ name, year: yr, stars });
     });
-
     if ($("li.film-detail").length===0 && $("ul.poster-list li").length===0) break;
   }
   const map = new Map(results.map(r=> [`${r.name}~${r.year}~${r.stars}`, r]));
   return Array.from(map.values());
 }
-
-async function readDiaryHTML(user){
-  const out = [];
-  for (let p=1; p<=5; p++){
-    const url = p===1
-      ? `https://letterboxd.com/${user}/films/diary/`
-      : `https://letterboxd.com/${user}/films/diary/page/${p}/`;
+async function readDiaryLB(user){
+  const out=[];
+  for (let p=1;p<=5;p++){
+    const url = p===1 ? `https://letterboxd.com/${user}/films/diary/` : `https://letterboxd.com/${user}/films/diary/page/${p}/`;
     const html = await fetchLB(url);
     if (!html) break;
     const $ = cheerio.load(html);
@@ -82,13 +110,10 @@ async function readDiaryHTML(user){
   const map = new Map(out.map(f=> [`${f.name}~${f.year}`, f]));
   return Array.from(map.values());
 }
-
-async function readWatchlist(user){
-  const out = [];
-  for (let p=1; p<=5; p++){
-    const url = p===1
-      ? `https://letterboxd.com/${user}/watchlist/`
-      : `https://letterboxd.com/${user}/watchlist/page/${p}/`;
+async function readWatchlistLB(user){
+  const out=[];
+  for (let p=1;p<=5;p++){
+    const url = p===1 ? `https://letterboxd.com/${user}/watchlist/` : `https://letterboxd.com/${user}/watchlist/page/${p}/`;
     const html = await fetchLB(url);
     if (!html) break;
     const $ = cheerio.load(html);
@@ -105,7 +130,7 @@ async function readWatchlist(user){
   return Array.from(map.values());
 }
 
-// ---------- TMDb ----------
+// --- TMDb helpers ---
 async function tmdb(path, params = {}){
   const u = new URL(TMDB+path);
   u.searchParams.set("api_key", TMDB_KEY);
@@ -146,7 +171,7 @@ async function tmdbProviders(id, region="US"){
   return uniq(names);
 }
 
-// ---------- AI taste ----------
+// --- Embedding helpers ---
 function makeFingerprint(meta){
   const genres = (meta.genres||[]).map(g=>g.name).join(" ");
   const kw = (meta.keywords_full||[]).map(k=>k.name).join(" ");
@@ -159,38 +184,57 @@ async function embed(texts){
   const resp = await openai.embeddings.create({ model:"text-embedding-3-small", input:texts });
   return resp.data.map(d=> d.embedding);
 }
-function cosine(a,b){ let dot=0,na=0,nb=0; for (let i=0;i<a.length;i++){ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; } return dot/((Math.sqrt(na)*Math.sqrt(nb))||1); }
 
-// ---------- main ----------
+// --- main handler ---
 export default async function handler(req, res){
-  setVersion(res);
   try{
-    const params = req.method==="GET" ? req.query : (req.body||{});
-    const user = cleanUser(params.user);
-    const mode = (params.mode||"watchlist").toString();
-    const onlyFlatrate = String(params.onlyFlatrate||"true") !== "false";
-
+    const { user:rawUser, mode="watchlist", onlyFlatrate=true, traktToken } = req.method==="GET" ? req.query : (req.body||{});
+    const user = cleanUser(rawUser);
     if (!user) return res.status(400).send("Need a username.");
     if (!TMDB_KEY || !process.env.OPENAI_API_KEY) return res.status(500).send("Server missing API keys.");
 
-    const [ratings, diary, watchlist] = await Promise.all([
-      readRatings(user).catch(()=>[]),
-      readDiaryHTML(user).catch(()=>[]),
-      readWatchlist(user).catch(()=>[])
-    ]);
+    // 1) get data (Trakt first; else LB fallback)
+    let ratings=[], diary=[], watchlist=[];
+    if (traktToken){
+      const from = await fromTrakt(user, traktToken).catch(()=>({ratings:[],diary:[],watchlist:[]}));
+      ratings = from.ratings; diary = from.diary; watchlist = from.watchlist;
+    } else {
+      // warning: LB can be blocked/rate-limited; this is only as a fallback
+      [ratings, diary, watchlist] = await Promise.all([
+        readRatingsLB(user).catch(()=>[]),
+        readDiaryLB(user).catch(()=>[]),
+        readWatchlistLB(user).catch(()=>[])
+      ]);
+    }
 
     if (!ratings.length && !diary.length && !watchlist.length){
-      return res.status(400).send("Still couldn't read any public data for this username. If your pages open fine in your browser, this proxy should now handle it—double-check spelling.");
+      return res.status(400).send("No data visible. Connect Trakt (Step 1–2) or make your Letterboxd lists publicly readable.");
     }
 
-    // seeds from ratings ≥4★, else diary, else watchlist
+    // 2) build seeds
     const liked = ratings.filter(r=> r.stars>=4).slice(0,200);
-    const likedIds = [];
+    const seedIds = [];
+    // from ratings
     for (const r of liked.slice(0,60)){
       const hit = await tmdbSearch(r.name, r.year);
-      if (hit?.id) likedIds.push(hit.id);
+      if (hit?.id) seedIds.push(hit.id);
+    }
+    // from diary if needed
+    if (!seedIds.length && diary.length){
+      for (const d of diary.slice(0,40)){
+        const hit = await tmdbSearch(d.name, d.year);
+        if (hit?.id) seedIds.push(hit.id);
+      }
+    }
+    // from watchlist if needed
+    if (!seedIds.length && watchlist.length){
+      for (const w of watchlist.slice(0,30)){
+        const hit = await tmdbSearch(w.name, w.year);
+        if (hit?.id) seedIds.push(hit.id);
+      }
     }
 
+    // 3) candidates
     let candidates = [];
     if (mode==="watchlist" && watchlist.length){
       for (const w of watchlist.slice(0,400)){
@@ -201,19 +245,6 @@ export default async function handler(req, res){
         }
       }
     } else {
-      let seedIds = likedIds;
-      if (!seedIds.length && diary.length){
-        for (const d of diary.slice(0,40)){
-          const hit = await tmdbSearch(d.name, d.year);
-          if (hit?.id) seedIds.push(hit.id);
-        }
-      }
-      if (!seedIds.length && watchlist.length){
-        for (const w of watchlist.slice(0,30)){
-          const hit = await tmdbSearch(w.name, w.year);
-          if (hit?.id) seedIds.push(hit.id);
-        }
-      }
       const recIds = await tmdbRecsFromIds(uniq(seedIds), 5);
       for (const id of recIds.slice(0,400)){
         const meta = await tmdbDetails(id);
@@ -227,30 +258,13 @@ export default async function handler(req, res){
         }
       }
     }
-
     if (!candidates.length) return res.status(400).send("No candidates available.");
 
-    // taste seeds
+    // 4) taste embeddings
     const tasteSeeds = [];
-    if (likedIds.length){
-      for (const id of likedIds.slice(0,40)){
+    if (seedIds.length){
+      for (const id of seedIds.slice(0,40)){
         const meta = await tmdbDetails(id);
-        tasteSeeds.push(makeFingerprint(meta));
-      }
-    }
-    if (!tasteSeeds.length && diary.length){
-      for (const d of diary.slice(0,40)){
-        const hit = await tmdbSearch(d.name, d.year);
-        if (!hit) continue;
-        const meta = await tmdbDetails(hit.id);
-        tasteSeeds.push(makeFingerprint(meta));
-      }
-    }
-    if (!tasteSeeds.length && watchlist.length){
-      for (const w of watchlist.slice(0,30)){
-        const hit = await tmdbSearch(w.name, w.year);
-        if (!hit) continue;
-        const meta = await tmdbDetails(hit.id);
         tasteSeeds.push(makeFingerprint(meta));
       }
     }
@@ -262,6 +276,7 @@ export default async function handler(req, res){
     ]);
     const userAvg = userVecs[0].map((_,i)=> userVecs.reduce((s,v)=> s+v[i], 0) / userVecs.length);
 
+    // 5) scoring
     function overlapBonus(meta){
       let bonus=0;
       const bag = tasteSeeds.join(" ").toLowerCase();
@@ -276,18 +291,17 @@ export default async function handler(req, res){
       const pop = meta.popularity || 0;
       return Math.max(0, Math.min(0.25, (votes/50000)*0.25 + (pop/200)*0.1));
     }
-
     const scored = candidates.map((c,i)=>{
       const sim = cosine(userAvg, candVecs[i]);
       const score = sim + overlapBonus(c.meta) - mainstreamPenalty(c.meta);
       return { ...c, score };
     }).sort((a,b)=> b.score - a.score);
 
-    // providers + filter
+    // 6) providers + output
     const enriched=[];
     for (const s of scored.slice(0,80)){
       const providers = await tmdbProviders(s.id, "US");
-      const show = onlyFlatrate ? providers.some(p=> !/\(|rent|buy/i.test(p)) : true;
+      const show = String(onlyFlatrate)!=="false" ? providers.some(p=> !/\(|rent|buy/i.test(p)) : true;
       enriched.push({ ...s, providers, show });
     }
     const visible = enriched.filter(x=> x.show);
@@ -303,12 +317,12 @@ export default async function handler(req, res){
       <div style="border:1px solid #272727;border-radius:12px;padding:14px;margin:12px 0"><b>Alternates</b><br/>
         ${alts.map((a,i)=> `<div style="opacity:.9">${i+1}. ${title(a.meta)} ${a.providers?.length? a.providers.map(pill).join(" "):""}</div>`).join("")}
       </div>
-      <div style="opacity:.6;font-size:12px">Signals used — Ratings: ${ratings.length} • Diary: ${diary.length} • Watchlist: ${watchlist.length}</div>
+      <div style="opacity:.6;font-size:12px">Signals used — Ratings: ${ratings.length} • Diary: ${diary.length} • Watchlist: ${watchlist.length} ${traktToken ? "• Source: Trakt" : "• Source: Letterboxd (fallback)"} </div>
     `;
     res.setHeader("Content-Type","text/html; charset=utf-8");
     return res.status(200).send(html);
 
-  } catch(e){
+  } catch (e){
     return res.status(500).send(`Error: ${e.message}`);
   }
 }
